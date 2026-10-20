@@ -130,8 +130,42 @@ def validate_historical_bar(df, now, code, quote=None):
     return True, '公开历史日K（含成交量）与收盘后行情快照核对通过'
 
 
+def choose_daily_candle(candidates, now, quote):
+    """Confirm today's bar only from complete daily OHLCV and independent evidence.
+
+    If the official vendor API is unavailable, two independent public historical
+    feeds agreeing on the same closing price suffice for a *cross-checked public*
+    close. Never call this exchange-certified data.
+    """
+    latest = max(candidates, key=lambda x: (x[0], x[1]))
+    last_date, _, provider, df = latest
+    diagnostics = []
+    for date, length, source, frame in candidates:
+        row = frame.iloc[-1]
+        diagnostics.append({'source': source, 'last_date': date,
+                            'bars': length, 'last_close': number(row.close),
+                            'last_volume': number(row.volume), 'status': 'ok'})
+    if last_date != now.strftime('%Y-%m-%d'):
+        return df, provider, False, '历史数据最新日为'+last_date, diagnostics
+    valid, reason = validate_historical_bar(df, now, '', quote)
+    if valid:
+        return df, provider, True, reason, diagnostics
+    if now.time() < CLOSE_CONFIRM_AFTER:
+        return df, provider, False, reason, diagnostics
+    matching = []
+    base_close = float(df.iloc[-1].close)
+    tol = max(0.01, base_close*QUOTE_CLOSE_REL_TOL)
+    for date, _, src, frame in candidates:
+        row = frame.iloc[-1]
+        if (date == last_date and pd.notna(row.volume) and float(row.volume)>0
+                and abs(float(row.close)-base_close)<=tol):
+            matching.append(src)
+    if len(set(matching)) >= 2:
+        return df, provider, True, '两家独立公开日线源收盘价与完整成交量核对一致：'+','.join(matching), diagnostics
+    return df, provider, False, reason+'；交叉确认不足', diagnostics
+
+
 def history(code):
-    """Compare dated unadjusted candles from multiple providers; confirm carefully."""
     start = '20250101'
     now = datetime.now(TZ)
     end = now.strftime('%Y%m%d')
@@ -141,44 +175,43 @@ def history(code):
         ('tencent', lambda: ak.stock_zh_a_hist_tx(symbol=prefix+code,start_date=start,end_date=end,adjust='')),
         ('sina', lambda: ak.stock_zh_a_daily(symbol=prefix+code,start_date=start,end_date=end,adjust='')),
     ]
-    candidates = []
-    for provider,get in upstream:
+    candidates, diagnostics = [], []
+    for provider, get in upstream:
         try:
             df = normalize_history(get(), provider)
-            candidates.append((str(df.iloc[-1].date), len(df), provider, df))
-            print('HISTORY', code, provider, df.iloc[-1].date, 'bars',len(df), flush=True)
+            date = str(df.iloc[-1].date)
+            candidates.append((date,len(df),provider,df))
+            print('HISTORY',code,provider,date,'bars',len(df),flush=True)
         except Exception as exc:
-            print('HISTORY FAIL',code,provider,str(exc)[:130],flush=True)
+            message = str(exc)[:170]
+            diagnostics.append({'source':provider,'status':'failed','error':message})
+            print('HISTORY FAIL',code,provider,message,flush=True)
     if not candidates:
-        raise RuntimeError('所有日线来源不可用；绝不生成虚构行情')
-    _, _, provider, df = max(candidates,key=lambda x:(x[0],x[1]))
-    q = None
-    quote_time = None
-    if now.weekday() < 5 and now.time() >= clock_time(9,30) and now.time() <= clock_time(20,0):
+        raise RuntimeError('所有历史日线来源失败，不能生成收盘确认')
+    q, quote_time, quote_error = None, None, None
+    if now.weekday()<5 and clock_time(9,30)<=now.time()<=clock_time(23,59):
         try:
-            q = quote_tencent(code,now)
+            q=quote_tencent(code,now)
             quote_time=q['stamp']
         except Exception as exc:
-            print('QUOTE FAIL',code,str(exc)[:140],flush=True)
-
-    confirmed, reason = validate_historical_bar(df,now,code,q)
-    historical_last = str(df.iloc[-1].date)
+            quote_error=str(exc)[:170]
+            print('QUOTE FAIL',code,quote_error,flush=True)
+    df, provider, confirmed, reason, successes = choose_daily_candle(candidates,now,q)
+    diagnostics += successes
+    historical_last=str(df.iloc[-1].date)
     provisional = False
-    # If confirmed history has not yet reached today's session, append today's timestamped
-    # quote for display only. Volume remains NaN, never invented or mixed with yesterday.
     if q is not None and q['date'] > historical_last:
-        df = pd.concat([df,pd.DataFrame([{k:q[k] for k in ('date','open','high','low','close')}])],ignore_index=True)
+        df=pd.concat([df,pd.DataFrame([{k:q[k] for k in ('date','open','high','low','close')}])],ignore_index=True)
         df['volume']=pd.to_numeric(df['volume'],errors='coerce')
         provisional=True
-        reason='行情快照（历史日K尚未发布；成交量未知）'
-        print('LIVE PROVISIONAL',code,q['date'],quote_time,flush=True)
-    elif historical_last == now.strftime('%Y-%m-%d') and not confirmed:
-        # A dated daily row before provider's settlement or failing cross-check remains
-        # provisional, even though its OHLCV may be populated.
-        provisional=True
-        reason='当日日K尚未核验：'+reason
-    bar_status = 'provisional_quote' if provisional else 'historical_daily'
-    return df,provider,provisional,quote_time,bar_status,reason
+        reason='临时行情：当日历史日K未发布，成交量未知'
+    elif historical_last == now.strftime('%Y-%m-%d'):
+        provisional=not confirmed
+    # Older historical bar is not the current session's close; downstream stale filter still applies.
+    diag={'historical_sources':diagnostics,'quote_status': 'ok' if q else 'unavailable',
+          'quote_error':quote_error,'close_check':reason,
+          'selected_historical_date':historical_last}
+    return df,provider,provisional,quote_time,('provisional_quote' if provisional else 'historical_daily'),reason,diag
 
 
 def money_flow(code):
@@ -188,7 +221,7 @@ def money_flow(code):
         df = ak.stock_individual_fund_flow(stock=code, market=market)
         if df is None or df.empty or not {'日期','主力净流入-净额'}.issubset(df.columns):
             return []
-        df = df.sort_values('日期').drop_duplicates('日期').tail(12)
+        df = df.sort_values('日期').drop_duplicates('日期').tail(20)
         out = []
         for _, row in df.iterrows():
             dt = pd.to_datetime(row['日期'], errors='coerce')
@@ -203,7 +236,7 @@ def money_flow(code):
         return []
 
 
-def calculate(code, name, sector, df, provider, flow_rows, provisional=False, quote_time=None, bar_status="historical_daily", confirmation_reason=""):
+def calculate(code, name, sector, df, provider, flow_rows, provisional=False, quote_time=None, bar_status="historical_daily", confirmation_reason="", diagnostics=None):
     df = df.copy()
     for n in (5,10,20):
         df[f'ma{n}'] = df.close.rolling(n).mean()
@@ -222,7 +255,12 @@ def calculate(code, name, sector, df, provider, flow_rows, provisional=False, qu
     # Require flows for exactly the most recent three daily candles, not an arbitrary old 3-day set.
     expected_dates = df.date.tail(3).tolist()
     flows_by_day = {f['date']:f for f in flow_rows}
-    aligned = [flows_by_day.get(day, {'date':day,'net_yuan':None,'net_pct':None}) for day in expected_dates]
+    aligned = [dict(flows_by_day.get(day, {'date':day,'net_yuan':None,'net_pct':None}),
+                    status='available' if flows_by_day.get(day,{}).get('net_yuan') is not None else 'pending_or_unavailable')
+               for day in expected_dates]
+    # Independently show the three latest published flow dates (even if D0 is missing).
+    published = [dict(x,status='available') for x in sorted(flow_rows,key=lambda z:z['date'])
+                 if x.get('net_yuan') is not None][-3:]
     flow_complete = all(x.get('net_yuan') is not None and x.get('net_pct') is not None for x in aligned)
     flow_amount_complete = all(x.get('net_yuan') is not None for x in aligned)
     positives = sum(1 for x in aligned if x.get('net_yuan') is not None and x['net_yuan'] > 0)
@@ -288,7 +326,9 @@ def calculate(code, name, sector, df, provider, flow_rows, provisional=False, qu
             'stop_distance_pct':number(risk_pct),'risk_ok':risk_ok,'trade_eligible':eligible_first,
             'flow_positive_days':positives,'flow_net_sum_3d_yuan':number(flow_total,2),
             'flow_avg_net_pct_3d':number(flow_mean_pct),'flow_strong':flow_strength,
-            'fund_flow_3d':aligned,'fund_flow_status':('available' if flow_complete else
+            'fund_flow_3d':aligned,'fund_flow_published_recent':published,
+            'fund_flow_missing_dates':[x['date'] for x in aligned if x['status']!='available'],
+            'data_diagnostics':diagnostics or {},'fund_flow_status':('available' if flow_complete else
                              'amount_only' if flow_amount_complete else 'unavailable'),
             'signal_blockers':blockers,'candles':candles}
 
@@ -296,7 +336,7 @@ def calculate(code, name, sector, df, provider, flow_rows, provisional=False, qu
 def main():
     now = datetime.now(TZ)
     data = {'updated_at_beijing':now.isoformat(), 'status':'ok',
-            'model_version':'v2.2-close-confirmed','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
+            'model_version':'v2.3-source-diagnostics','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
             'universe':'固定12只候选股票，非全市场动态轮动',
             'strategy_rules':{'max_stop_distance_pct':MAX_STOP_PCT,
                               'max_ma20_deviation_pct':MAX_MA20_DEVIATION_PCT,
@@ -306,9 +346,9 @@ def main():
             'stocks':[], 'errors':[]}
     for code, (name, sector) in UNIVERSE.items():
         try:
-            df,provider,provisional,quote_time,bar_status,reason = history(code)
+            df,provider,provisional,quote_time,bar_status,reason,diag = history(code)
             data['stocks'].append(calculate(code,name,sector,df,provider,money_flow(code),
-                                            provisional,quote_time,bar_status,reason))
+                                            provisional,quote_time,bar_status,reason,diag))
             print('OK', code, flush=True)
         except Exception as exc:
             data['errors'].append({'code':code,'error':str(exc)[:180]})
