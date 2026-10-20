@@ -35,19 +35,72 @@ def number(x):
     except (ValueError, TypeError):
         return None
 
+
 def history(code):
-    df = ak.stock_zh_a_hist(symbol=code, period='daily', start_date='20250101',
-                            end_date=datetime.now(TZ).strftime('%Y%m%d'), adjust='qfq')
-    mapping = {'日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume','成交额':'amount'}
+    start = '20250101'
+    end = datetime.now(TZ).strftime('%Y%m%d')
+
+    try:
+        # 第一数据源：东方财富
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period='daily',
+            start_date=start,
+            end_date=end,
+            adjust='qfq'
+        )
+        if df is None or df.empty:
+            raise ValueError('东方财富返回空数据')
+        print('SOURCE eastmoney', code, flush=True)
+
+    except Exception as exc:
+        print('EASTMONEY FAILED', code, str(exc), flush=True)
+
+        # 第二数据源：腾讯证券
+        prefix = 'sh' if code.startswith('6') else 'sz'
+        df = ak.stock_zh_a_hist_tx(
+            symbol=prefix + code,
+            start_date=start,
+            end_date=end,
+            adjust='qfq'
+        )
+        if df is None or df.empty:
+            raise ValueError('腾讯证券返回空数据')
+        print('SOURCE tencent', code, flush=True)
+
+    mapping = {
+        '日期': 'date',
+        '开盘': 'open',
+        '收盘': 'close',
+        '最高': 'high',
+        '最低': 'low',
+        '成交量': 'volume',
+        '成交额': 'amount'
+    }
     df = df.rename(columns=mapping)
-    needed = ['date','open','high','low','close','volume']
+
+    # 腾讯接口部分版本将成交量放在 amount 列
+    # 只将其用于同源相对量能比较，不视为成交额
+    if 'volume' not in df.columns and 'amount' in df.columns:
+        df['volume'] = df['amount']
+        df = df.drop(columns=['amount'])
+
+    needed = ['date', 'open', 'high', 'low', 'close', 'volume']
     if not all(k in df.columns for k in needed):
-        raise ValueError('Missing OHLCV fields')
+        raise ValueError('行情缺少必要字段: ' + str(list(df.columns)))
+
     df = df.sort_values('date').drop_duplicates('date').reset_index(drop=True)
-    for k in needed[1:]: df[k] = pd.to_numeric(df[k], errors='coerce')
+
+    for k in needed[1:]:
+        df[k] = pd.to_numeric(df[k], errors='coerce')
+
     df = df.dropna(subset=needed[1:])
-    if len(df) < 35: raise ValueError('Less than 35 daily candles')
+
+    if len(df) < 35:
+        raise ValueError('有效日K线不足35根')
+
     return df
+
 
 def money_flow(code):
     # AKShare provider may change schema or fail; never estimate missing flows.
