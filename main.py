@@ -1,3 +1,227 @@
+"""A-share rotation model v2: evidence-gated, risk-controlled research signals.
+
+No fictional quotes or money-flow. Keep JSON output backward-compatible with v1 UI.
+"""
+import json
+import re
+import time
+import requests
+from datetime import datetime, time as clock_time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import akshare as ak
+import numpy as np
+import pandas as pd
+
+TZ = ZoneInfo('Asia/Shanghai')
+OUT = Path('docs/data.json')
+MAX_STOP_PCT = 8.0
+MAX_MA20_DEVIATION_PCT = 10.0
+# Wait for the upstream's delayed official daily-bar publication, not merely the 15:00 bell.
+CLOSE_CONFIRM_AFTER = clock_time(15, 10)
+QUOTE_CLOSE_REL_TOL = 0.001  # 0.1%, with minimum ¥0.01 absolute
+
+UNIVERSE = {
+    '300115': ('长盈精密', '机器人'),
+    '688836': ('宇树科技-W', '机器人'),
+    '603119': ('浙江荣泰', '机器人'),
+    '605488': ('福莱新材', '机器人'),
+    '002164': ('宁波东力', '机器人'),
+    '688608': ('恒玄科技', '半导体'),
+    '688689': ('银河微电', '半导体'),
+    '688071': ('华依科技', '机器人'),
+    '603068': ('博通集成', '半导体'),
+    '603986': ('兆易创新', '半导体'),
+    '688018': ('乐鑫科技', '半导体'),
+    '688525': ('佰维存储', '半导体'),
+}
+
+
+def number(value, decimals=4):
+    try:
+        value = float(str(value).strip().replace(',', '').replace('%', ''))
+        return round(value, decimals) if np.isfinite(value) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_history(df, provider):
+    """Normalize unadjusted historical OHLCV; never mix qfq with spot raw quotes."""
+    if df is None or df.empty:
+        raise ValueError('历史行情为空')
+    df = df.rename(columns={'日期':'date','开盘':'open','最高':'high','最低':'low',
+                            '收盘':'close','成交量':'volume','成交额':'amount'}).copy()
+    # Tencent's API may call share volume 'amount'; check known column meanings.
+    if 'volume' not in df.columns and 'amount' in df.columns and provider == 'tencent':
+        df['volume'] = df['amount']
+        df = df.drop(columns=['amount'])
+    required = ['date','open','high','low','close','volume']
+    if any(k not in df.columns for k in required):
+        raise ValueError('OHLCV字段缺失：' + str(list(df.columns)))
+    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+    for key in required[1:]:
+        df[key] = pd.to_numeric(df[key], errors='coerce')
+    df = df.dropna(subset=required).sort_values('date').drop_duplicates('date').reset_index(drop=True)
+    if len(df) < 26:
+        raise ValueError(f'有效日线只有{len(df)}根，至少需要26根')
+    return df
+
+
+def quote_tencent(code, now):
+    """Optional latest timestamped quote; no quote means no synthesized new bar.
+
+    Tencent quote positions: last=3, open=5, stamp=30, high=33, low=34.
+    This feed is not a certified exchange closing-data feed.
+    """
+    prefix = 'sh' if code.startswith('6') else 'sz'
+    res = requests.get('https://qt.gtimg.cn/q=' + prefix + code,
+                       headers={'User-Agent':'Mozilla/5.0','Referer':'https://gu.qq.com/'},
+                       timeout=7)
+    res.raise_for_status()
+    text = res.content.decode('gbk', errors='replace')
+    match = re.search(r'="([^"]+)"', text)
+    if not match:
+        raise ValueError('腾讯快照结构不符')
+    v = match.group(1).split('~')
+    if len(v) < 35 or v[2] != code or not re.fullmatch(r'\d{14}', v[30]):
+        raise ValueError('腾讯快照股票或时间字段无效')
+    stamp = datetime.strptime(v[30], '%Y%m%d%H%M%S').replace(tzinfo=TZ)
+    seconds_old = (now-stamp).total_seconds()
+    if stamp > now or (seconds_old > 1200 and not (15 <= now.hour <= 20 and stamp.hour == 15)):
+        raise ValueError('快照时间过旧/无效：' + stamp.isoformat())
+    if stamp.date() != now.date():
+        raise ValueError('快照不是今日行情：' + stamp.isoformat())
+    px, op, hi, lo = (float(v[i]) for i in (3,5,33,34))
+    if not (0 < lo <= min(op,px) <= max(op,px) <= hi and hi < 100000):
+        raise ValueError('快照OHLC逻辑校验失败')
+    return {'date':stamp.strftime('%Y-%m-%d'), 'open':op,'high':hi,'low':lo,
+            'close':px, 'stamp':stamp.isoformat()}
+
+
+def validate_historical_bar(df, now, code, quote=None):
+    """Return (confirmed, reason). A daily row dated today is not enough at 15:00.
+
+    A public source's complete end-of-day OHLCV and a post-close quote with a
+    matching close are required for today's 'confirmed' display status.
+    Historical rows from past dates are source-published historical candles.
+    This is NOT an exchange-certified or broker-settled confirmation.
+    """
+    row = df.iloc[-1]
+    last_date = str(row.date)
+    if last_date != now.strftime('%Y-%m-%d'):
+        return True, '历史交易日日线：公开数据源提供的完整OHLCV'
+    if now.time() < CLOSE_CONFIRM_AFTER:
+        return False, '15:10前不得把当日历史K线视为已确认收盘数据'
+    values = [number(row[k]) for k in ('open','high','low','close','volume')]
+    if any(x is None for x in values) or values[-1] <= 0:
+        return False, '当日收盘日线OHLCV不完整'
+    op,hi,lo,cl,vol = values
+    if not (0 < lo <= min(op,cl) <= max(op,cl) <= hi):
+        return False, '当日日K行情逻辑校验失败'
+    if not quote or quote['date'] != last_date:
+        return False, '等待15:00后有效行情快照交叉核对收盘价'
+    stamp = datetime.fromisoformat(quote['stamp'])
+    if stamp.time() < clock_time(15,0):
+        return False, '快照未覆盖收盘时段'
+    tolerance = max(0.01, cl*QUOTE_CLOSE_REL_TOL)
+    if abs(quote['close'] - cl) > tolerance:
+        return False, '日K收盘价与收盘后快照不一致'
+    return True, '公开历史日K（含成交量）与收盘后行情快照核对通过'
+
+
+def history(code):
+    """Compare dated unadjusted candles from multiple providers; confirm carefully."""
+    start = '20250101'
+    now = datetime.now(TZ)
+    end = now.strftime('%Y%m%d')
+    prefix = 'sh' if code.startswith('6') else 'sz'
+    upstream = [
+        ('eastmoney', lambda: ak.stock_zh_a_hist(symbol=code,period='daily',start_date=start,end_date=end,adjust='')),
+        ('tencent', lambda: ak.stock_zh_a_hist_tx(symbol=prefix+code,start_date=start,end_date=end,adjust='')),
+        ('sina', lambda: ak.stock_zh_a_daily(symbol=prefix+code,start_date=start,end_date=end,adjust='')),
+    ]
+    candidates = []
+    for provider,get in upstream:
+        try:
+            df = normalize_history(get(), provider)
+            candidates.append((str(df.iloc[-1].date), len(df), provider, df))
+            print('HISTORY', code, provider, df.iloc[-1].date, 'bars',len(df), flush=True)
+        except Exception as exc:
+            print('HISTORY FAIL',code,provider,str(exc)[:130],flush=True)
+    if not candidates:
+        raise RuntimeError('所有日线来源不可用；绝不生成虚构行情')
+    _, _, provider, df = max(candidates,key=lambda x:(x[0],x[1]))
+    q = None
+    quote_time = None
+    if now.weekday() < 5 and now.time() >= clock_time(9,30) and now.time() <= clock_time(20,0):
+        try:
+            q = quote_tencent(code,now)
+            quote_time=q['stamp']
+        except Exception as exc:
+            print('QUOTE FAIL',code,str(exc)[:140],flush=True)
+
+    confirmed, reason = validate_historical_bar(df,now,code,q)
+    historical_last = str(df.iloc[-1].date)
+    provisional = False
+    # If confirmed history has not yet reached today's session, append today's timestamped
+    # quote for display only. Volume remains NaN, never invented or mixed with yesterday.
+    if q is not None and q['date'] > historical_last:
+        df = pd.concat([df,pd.DataFrame([{k:q[k] for k in ('date','open','high','low','close')}])],ignore_index=True)
+        df['volume']=pd.to_numeric(df['volume'],errors='coerce')
+        provisional=True
+        reason='行情快照（历史日K尚未发布；成交量未知）'
+        print('LIVE PROVISIONAL',code,q['date'],quote_time,flush=True)
+    elif historical_last == now.strftime('%Y-%m-%d') and not confirmed:
+        # A dated daily row before provider's settlement or failing cross-check remains
+        # provisional, even though its OHLCV may be populated.
+        provisional=True
+        reason='当日日K尚未核验：'+reason
+    bar_status = 'provisional_quote' if provisional else 'historical_daily'
+    return df,provider,provisional,quote_time,bar_status,reason
+
+
+def money_flow(code):
+    """Return source-provided net flow and source-provided net ratio, never synthesize."""
+    try:
+        market = 'sh' if code.startswith('6') else 'sz' if code.startswith(('0','3')) else 'bj'
+        df = ak.stock_individual_fund_flow(stock=code, market=market)
+        if df is None or df.empty or not {'日期','主力净流入-净额'}.issubset(df.columns):
+            return []
+        df = df.sort_values('日期').drop_duplicates('日期').tail(12)
+        out = []
+        for _, row in df.iterrows():
+            dt = pd.to_datetime(row['日期'], errors='coerce')
+            if pd.isna(dt):
+                continue
+            out.append({'date':dt.strftime('%Y-%m-%d'),
+                        'net_yuan':number(row['主力净流入-净额'], 2),
+                        'net_pct':number(row.get('主力净流入-净占比'))})
+        return out
+    except Exception as exc:
+        print('FLOW FAILED', code, str(exc)[:100], flush=True)
+        return []
+
+
+def calculate(code, name, sector, df, provider, flow_rows, provisional=False, quote_time=None, bar_status="historical_daily", confirmation_reason=""):
+    df = df.copy()
+    for n in (5,10,20):
+        df[f'ma{n}'] = df.close.rolling(n).mean()
+    ema12, ema26 = df.close.ewm(span=12, adjust=False).mean(), df.close.ewm(span=26, adjust=False).mean()
+    df['dif'] = ema12 - ema26
+    df['dea'] = df.dif.ewm(span=9, adjust=False).mean()
+    df['macd'] = 2*(df.dif-df.dea)
+    last, prev = df.iloc[-1], df.iloc[-2]
+    asof = str(last.date)
+    close, ma20 = float(last.close), float(last.ma20)
+    dev = 100*(close/ma20-1)
+    ma20_slope = 100*(ma20/float(df.iloc[-6].ma20)-1)
+    vol5 = float(df.volume.tail(5).mean())
+    volume_ratio = float(last.volume/vol5) if vol5 > 0 and pd.notna(last.volume) else None
+
+    # Require flows for exactly the most recent three daily candles, not an arbitrary old 3-day set.
+    expected_dates = df.date.tail(3).tolist()
+    flows_by_day = {f['date']:f for f in flow_rows}
     aligned = [flows_by_day.get(day, {'date':day,'net_yuan':None,'net_pct':None}) for day in expected_dates]
     flow_complete = all(x.get('net_yuan') is not None and x.get('net_pct') is not None for x in aligned)
     flow_amount_complete = all(x.get('net_yuan') is not None for x in aligned)
