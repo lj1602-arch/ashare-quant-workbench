@@ -31,7 +31,7 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
           data=json.loads(Path('docs/data.json').read_text(encoding='utf-8'))
-          assert data.get('model_version')=='v2.2-close-confirmed', 'V2.2 model did not run'
+          assert data.get('model_version')=='v2.3-source-diagnostics', 'V2.3 model did not run'
           assert len(data.get('stocks', []))>0, 'No stocks generated'
           dt=datetime.fromisoformat(data['updated_at_beijing'])
           assert dt.tzinfo and 0<=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()<900,'Output timestamp stale'
