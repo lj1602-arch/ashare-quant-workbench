@@ -22,6 +22,8 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - name: Compile Python modules
+        run: python -m py_compile main.py dynamic_rotation.py
       - name: Generate quant data
         run: python main.py
       - name: Verify refreshed output and model version
@@ -31,7 +33,7 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
           data=json.loads(Path('docs/data.json').read_text(encoding='utf-8'))
-          assert data.get('model_version')=='v2.4-dynamic-rotation', 'V2.3 model did not run'
+          assert data.get('model_version')=='v2.4-dynamic-rotation', 'V2.4 model did not run'
           assert len(data.get('stocks', []))>0, 'No stocks generated'
           dt=datetime.fromisoformat(data['updated_at_beijing'])
           assert dt.tzinfo and 0<=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()<900,'Output timestamp stale'
