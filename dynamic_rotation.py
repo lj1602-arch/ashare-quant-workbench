@@ -62,6 +62,7 @@ def rank_and_rotate(stocks, previous=None, asof=None, discovery_ok=False):
             selected.append(incumbent)
     selected.sort(key=lambda s: (-s["rotation_score"], s["code"]))
     selected_codes = {s["code"] for s in selected}
+    # Never promote a stock with stale daily bars to an actionable recommendation.
     for s in selected:
         s["rotation_status"] = "保留" if s["code"] in old else "新入选"
     removed = [dict(code=code, name=s.get("name", code), reason="排名下降或风险条件恶化")
