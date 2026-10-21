@@ -25,7 +25,6 @@ QUOTE_CLOSE_REL_TOL = 0.001  # 0.1%, with minimum ¥0.01 absolute
 
 UNIVERSE = {
     '300115': ('长盈精密', '机器人'),
-    '688836': ('宇树科技-W', '机器人'),
     '603119': ('浙江荣泰', '机器人'),
     '605488': ('福莱新材', '机器人'),
     '002164': ('宁波东力', '机器人'),
@@ -371,9 +370,12 @@ def main():
         except Exception as exc:
             data['errors'].append({'code':code,'error':str(exc)[:180]})
             print('ERROR',code,str(exc)[:180],flush=True)
-        time.sleep(0.6)
+        time.sleep(0.2)
     if not data['stocks']:
         raise RuntimeError('所有行情源失败，保留上次已发布的有效数据')
+    # Too few verified candidates is an incomplete scan, not evidence of rotation.
+    if discovery_ok and len(data['stocks']) < 8:
+        raise RuntimeError('动态扫描有效股票不足8只，停止发布，保留旧数据')
 
     # Demote stocks whose daily bars lag behind the freshest bar in this refresh batch.
     freshest = max(x['asof'] for x in data['stocks'])
@@ -395,6 +397,8 @@ def main():
     data['stocks'].sort(key=lambda s: (
         {'第一':0,'第二':1,'第三':2}[s['tier'][0:2]], -s['score'], s['code']))
     selected, event = rank_and_rotate(data['stocks'], previous, now.date().isoformat(), discovery_ok)
+    if not discovery_ok:
+        data['rotation_warning'] = '动态发现失败：未发生有效的新增/淘汰判定'
     data['stocks'] = selected
     data['rotation'] = event
     data['rotation_method'] = '全市场成交额初筛最多45只；日线评分前10；5分缓冲避免频繁换股'
