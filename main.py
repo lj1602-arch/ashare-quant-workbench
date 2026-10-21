@@ -11,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import akshare as ak
+from dynamic_rotation import discover, rank_and_rotate, persist_history
 import numpy as np
 import pandas as pd
 
@@ -336,7 +337,7 @@ def calculate(code, name, sector, df, provider, flow_rows, provisional=False, qu
 def main():
     now = datetime.now(TZ)
     data = {'updated_at_beijing':now.isoformat(), 'status':'ok',
-            'model_version':'v2.3-source-diagnostics','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
+            'model_version':'v2.4-dynamic-rotation','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
             'universe':'固定12只候选股票，非全市场动态轮动',
             'strategy_rules':{'max_stop_distance_pct':MAX_STOP_PCT,
                               'max_ma20_deviation_pct':MAX_MA20_DEVIATION_PCT,
@@ -344,7 +345,24 @@ def main():
                               'note':'收盘后日线须核对完整OHLCV及15:00后快照；临时行情、过期数据及缺失资金禁止第一梯队'},
             'disclaimer':'研究信号与条件参考价，不构成投资建议；不得按本工具自动下单。',
             'stocks':[], 'errors':[]}
-    for code, (name, sector) in UNIVERSE.items():
+    previous = {}
+    if OUT.exists():
+        try:
+            previous = json.loads(OUT.read_text(encoding='utf-8'))
+        except (ValueError, OSError):
+            pass
+    discovery_ok = False
+    universe = dict(UNIVERSE)
+    try:
+        discovered, screened_count = discover()
+        universe = discovered
+        discovery_ok = True
+        data['universe'] = '全A股实时列表筛选后的候选股票（非全市场完整逐只技术评分）'
+        data['discovery_screened_count'] = screened_count
+    except Exception as exc:
+        data['discovery_error'] = str(exc)[:180]
+        data['universe'] = '全市场发现失败：使用固定观察池降级，禁止声称全市场动态选股'
+    for code, (name, sector) in universe.items():
         try:
             df,provider,provisional,quote_time,bar_status,reason,diag = history(code)
             data['stocks'].append(calculate(code,name,sector,df,provider,money_flow(code),
@@ -376,10 +394,16 @@ def main():
     data['expected_session_date']=expected_date
     data['stocks'].sort(key=lambda s: (
         {'第一':0,'第二':1,'第三':2}[s['tier'][0:2]], -s['score'], s['code']))
-    if data['errors']:
+    selected, event = rank_and_rotate(data['stocks'], previous, now.date().isoformat(), discovery_ok)
+    data['stocks'] = selected
+    data['rotation'] = event
+    data['rotation_method'] = '全市场成交额初筛最多45只；日线评分前10；5分缓冲避免频繁换股'
+    if data['errors'] or not discovery_ok:
         data['status']='partial'
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')), encoding='utf-8')
+    if discovery_ok:
+        persist_history(event)
     print('Wrote', OUT, 'stocks',len(data['stocks']), 'latest',freshest)
 
 
