@@ -9,12 +9,12 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: ashare-refresh
+  group: ashare-refresh-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +22,8 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -r requirements.txt
+      - name: Compile Python modules
+        run: python -m py_compile main.py dynamic_rotation.py
       - name: Generate quant data
         run: python main.py
       - name: Verify refreshed output and model version
@@ -31,21 +33,38 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
           data=json.loads(Path('docs/data.json').read_text(encoding='utf-8'))
-          assert data.get('model_version')=='v2.3-source-diagnostics', 'V2.3 model did not run'
+          assert data.get('model_version')=='v2.4-dynamic-rotation', 'V2.4 model did not run'
           assert len(data.get('stocks', []))>0, 'No stocks generated'
           dt=datetime.fromisoformat(data['updated_at_beijing'])
           assert dt.tzinfo and 0<=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()<900,'Output timestamp stale'
           for s in data['stocks']:
               if s.get('bar_status')=='provisional_quote':
                   assert s.get('trade_eligible') is False, 'Provisional bar incorrectly trade eligible'
-          print('Verified V2.2 stocks',len(data['stocks']))
+          print('Verified V2.4 stocks',len(data['stocks']))
           PY
       - name: Commit data if changed
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/data.json
+          if [ -f docs/rotation_history.json ]; then git add docs/rotation_history.json; fi
           if ! git diff --cached --quiet; then
             git commit -m 'data: update verified A-share rotation signals'
-            git push
+            # Concurrent data refreshes or other commits may advance the remote branch.
+            # Rebase safely; never force-push or silently overwrite remote changes.
+            branch="${GITHUB_REF_NAME}"
+            for attempt in 1 2 3; do
+              git fetch origin "$branch"
+              if ! git rebase "origin/$branch"; then
+                git rebase --abort || true
+                echo "::error::Remote changes conflict with generated data; refusing to overwrite."
+                exit 1
+              fi
+              if git push origin "HEAD:$branch"; then
+                exit 0
+              fi
+              sleep $((attempt * 3))
+            done
+            echo "::error::Unable to push after 3 safe retries."
+            exit 1
           fi
