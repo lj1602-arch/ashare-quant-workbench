@@ -9,7 +9,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: ashare-refresh
+  group: ashare-refresh-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   update:
@@ -50,5 +50,21 @@ jobs:
           if [ -f docs/rotation_history.json ]; then git add docs/rotation_history.json; fi
           if ! git diff --cached --quiet; then
             git commit -m 'data: update verified A-share rotation signals'
-            git push
+            # Concurrent data refreshes or other commits may advance the remote branch.
+            # Rebase safely; never force-push or silently overwrite remote changes.
+            branch="${GITHUB_REF_NAME}"
+            for attempt in 1 2 3; do
+              git fetch origin "$branch"
+              if ! git rebase "origin/$branch"; then
+                git rebase --abort || true
+                echo "::error::Remote changes conflict with generated data; refusing to overwrite."
+                exit 1
+              fi
+              if git push origin "HEAD:$branch"; then
+                exit 0
+              fi
+              sleep $((attempt * 3))
+            done
+            echo "::error::Unable to push after 3 safe retries."
+            exit 1
           fi
