@@ -5,6 +5,8 @@ on:
     - cron: '0 1,3,6,7 * * 1-5'
     # After-close verification retries at Beijing 15:20 and 15:45
     - cron: '20,45 7 * * 1-5'
+    # Additional delayed-publication checks at Beijing 16:30 / 18:30
+    - cron: '30 8,10 * * 1-5'
   workflow_dispatch:
 permissions:
   contents: write
@@ -31,11 +33,14 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
           data=json.loads(Path('docs/data.json').read_text(encoding='utf-8'))
-          assert data.get('model_version')=='v2.3-source-diagnostics', 'V2.2 model did not run'
+          assert data.get('model_version')=='v2.4-risk-rotation', 'V2.4 model did not run'
           assert len(data.get('stocks', []))>0, 'No stocks generated'
+          assert data.get('candidate_count',0)>=len(data['stocks']), 'No watchlist rotation metadata'
+          assert data.get('refresh_completeness') in ('complete','incomplete_or_intraday'), 'Freshness diagnostic missing'
           dt=datetime.fromisoformat(data['updated_at_beijing'])
           assert dt.tzinfo and 0<=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()<900,'Output timestamp stale'
           for s in data['stocks']:
+              assert s.get('trade_eligible') is False or (s.get('risk_ok') is True and s.get('fund_flow_status')=='available' and not s.get('is_stale') and s.get('bar_status')=='historical_daily'), 'Invalid tier one promotion'
               assert 'data_diagnostics' in s and 'fund_flow_published_recent' in s, 'Missing data diagnostic fields'
               if s.get('bar_status')=='provisional_quote':
                   assert s.get('trade_eligible') is False, 'Provisional bar incorrectly trade eligible'

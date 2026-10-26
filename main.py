@@ -18,6 +18,7 @@ TZ = ZoneInfo('Asia/Shanghai')
 OUT = Path('docs/data.json')
 MAX_STOP_PCT = 8.0
 MAX_MA20_DEVIATION_PCT = 10.0
+MAX_ACTIVE_STOCKS = 12
 # Wait for the upstream's delayed official daily-bar publication, not merely the 15:00 bell.
 CLOSE_CONFIRM_AFTER = clock_time(15, 10)
 QUOTE_CLOSE_REL_TOL = 0.001  # 0.1%, with minimum ¥0.01 absolute
@@ -35,6 +36,9 @@ UNIVERSE = {
     '603986': ('兆易创新', '半导体'),
     '688018': ('乐鑫科技', '半导体'),
     '688525': ('佰维存储', '半导体'),
+    '000559': ('万向钱潮', '机器人'),
+    '000700': ('模塑科技', '机器人'),
+    '688585': ('上纬新材', '机器人'),
 }
 
 
@@ -214,26 +218,89 @@ def history(code):
     return df,provider,provisional,quote_time,('provisional_quote' if provisional else 'historical_daily'),reason,diag
 
 
-def money_flow(code):
-    """Return source-provided net flow and source-provided net ratio, never synthesize."""
+def safe_flow_rows(df, source='eastmoney'):
+    """Strictly parse individually dated money-flow records; no aggregation inference."""
+    if df is None or df.empty:
+        return []
+    amount_col = '主力净流入-净额'
+    if not {'日期', amount_col, '主力净流入-净占比'}.issubset(df.columns):
+        return []
+    output = []
+    for _, row in df.iterrows():
+        dt = pd.to_datetime(row['日期'], errors='coerce')
+        if pd.isna(dt):
+            continue
+        amount = number(row[amount_col], 2)
+        pct = number(row['主力净流入-净占比'])
+        if amount is None or pct is None:
+            continue
+        output.append({'date': dt.strftime('%Y-%m-%d'), 'net_yuan': amount,
+                       'net_pct': pct, 'source': source})
+    return sorted({r['date']:r for r in output}.values(), key=lambda r:r['date'])[-30:]
+
+
+def money_flow(code, historical_cache=None):
+    """Fetch dated Eastmoney flows; reuse previously published *dated evidence* only.
+
+    Last-known genuine dated flows never become today's fabricated flows.
+    THS three-day ranking is supplemental evidence, never substituted for daily flows.
+    """
+    historical_cache = historical_cache or []
+    diagnostics = {'source': 'eastmoney', 'status': 'unavailable', 'fallback': 'none'}
+    rows = []
     try:
         market = 'sh' if code.startswith('6') else 'sz' if code.startswith(('0','3')) else 'bj'
-        df = ak.stock_individual_fund_flow(stock=code, market=market)
-        if df is None or df.empty or not {'日期','主力净流入-净额'}.issubset(df.columns):
-            return []
-        df = df.sort_values('日期').drop_duplicates('日期').tail(20)
-        out = []
-        for _, row in df.iterrows():
-            dt = pd.to_datetime(row['日期'], errors='coerce')
-            if pd.isna(dt):
-                continue
-            out.append({'date':dt.strftime('%Y-%m-%d'),
-                        'net_yuan':number(row['主力净流入-净额'], 2),
-                        'net_pct':number(row.get('主力净流入-净占比'))})
-        return out
+        rows = safe_flow_rows(ak.stock_individual_fund_flow(stock=code, market=market))
+        diagnostics['status'] = 'ok' if rows else 'empty_or_schema_changed'
     except Exception as exc:
-        print('FLOW FAILED', code, str(exc)[:100], flush=True)
-        return []
+        diagnostics['status'] = 'failed'
+        diagnostics['error'] = str(exc)[:180]
+        print('FLOW FAILED', code, diagnostics['error'], flush=True)
+    genuine_cache = []
+    for x in historical_cache:
+        try:
+            if (re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(x.get('date','')))
+                    and number(x.get('net_yuan'),2) is not None
+                    and number(x.get('net_pct')) is not None
+                    and x['date'] <= datetime.now(TZ).strftime('%Y-%m-%d')):
+                genuine_cache.append({'date':x['date'],'net_yuan':number(x['net_yuan'],2),
+                                      'net_pct':number(x['net_pct']), 'source':x.get('source','prior_verified_snapshot')})
+        except Exception:
+            continue
+    by_day = {r['date']:r for r in genuine_cache}
+    by_day.update({r['date']:r for r in rows})
+    if genuine_cache and not rows:
+        diagnostics['fallback'] = 'dated_cache_only'
+    diagnostics['available_dates'] = sorted(by_day)[-5:]
+    return sorted(by_day.values(), key=lambda r:r['date'])[-30:], diagnostics
+
+
+def ths_aggregate_three_day():
+    """Optional THS 3-day *aggregate*, never proof of 2/3 positive flow days."""
+    try:
+        fn = getattr(ak, 'stock_fund_flow_individual', None)
+        if fn is None:
+            return {}, {'status':'api_not_found'}
+        df = fn(symbol='3日排行')
+        if df is None or df.empty or not {'股票代码','资金流入净额'}.issubset(df.columns):
+            return {}, {'status':'unavailable_or_schema_changed'}
+        def numeric_amount(v):
+            if isinstance(v,str):
+                v=v.replace(',','').strip()
+                unit = 1e8 if v.endswith('亿') else 1e4 if v.endswith('万') else 1
+                if unit != 1:
+                    return number(v[:-1], 4)*unit if number(v[:-1], 4) is not None else None
+            return number(v,2)
+        output={}
+        for _, r in df.iterrows():
+            code=str(r['股票代码']).split('.')[0].zfill(6)
+            amount=numeric_amount(r['资金流入净额'])
+            if amount is not None:
+                output[code]={'net_yuan_3d':round(amount,2),'source':'ths_public_3d_ranking',
+                              'note':'三日汇总排名，不能推导逐日流入天数或当日数据'}
+        return output, {'status':'ok','matched_count':len(output)}
+    except Exception as exc:
+        return {}, {'status':'failed','error':str(exc)[:180]}
 
 
 def calculate(code, name, sector, df, provider, flow_rows, provisional=False, quote_time=None, bar_status="historical_daily", confirmation_reason="", diagnostics=None):
@@ -336,19 +403,34 @@ def calculate(code, name, sector, df, provider, flow_rows, provisional=False, qu
 def main():
     now = datetime.now(TZ)
     data = {'updated_at_beijing':now.isoformat(), 'status':'ok',
-            'model_version':'v2.3-source-diagnostics','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
-            'universe':'固定12只候选股票，非全市场动态轮动',
+            'model_version':'v2.4-risk-rotation','provider':'AKShare Eastmoney / Tencent / Sina (unadjusted); timestamped Tencent quote confirmation',
+            'universe':'15只经人工选择的技术及机器人观察候选，按数据和风控规则动态选取至多12只；不是全市场行业扫描',
             'strategy_rules':{'max_stop_distance_pct':MAX_STOP_PCT,
                               'max_ma20_deviation_pct':MAX_MA20_DEVIATION_PCT,
                               'fund_flow':'必须与最近3根日K线日期一致，至少2日流入、3日净额为正且日均净占比>=0.5%',
                               'note':'收盘后日线须核对完整OHLCV及15:00后快照；临时行情、过期数据及缺失资金禁止第一梯队'},
             'disclaimer':'研究信号与条件参考价，不构成投资建议；不得按本工具自动下单。',
             'stocks':[], 'errors':[]}
+    previous = {}
+    if OUT.exists():
+        try:
+            previous = {x['code']:x for x in json.loads(OUT.read_text(encoding='utf-8')).get('stocks', [])}
+        except Exception as exc:
+            print('PREVIOUS DATA READ FAILED', str(exc)[:120], flush=True)
+    ths_rank, ths_status = ths_aggregate_three_day()
+    data['ths_3d_status'] = ths_status
     for code, (name, sector) in UNIVERSE.items():
         try:
             df,provider,provisional,quote_time,bar_status,reason,diag = history(code)
-            data['stocks'].append(calculate(code,name,sector,df,provider,money_flow(code),
-                                            provisional,quote_time,bar_status,reason,diag))
+            prior=previous.get(code,{})
+            cached=(prior.get('fund_flow_published_recent') or []) + (prior.get('fund_flow_3d') or [])
+            flows, flow_diag = money_flow(code, cached)
+            diag['fund_flow_source'] = flow_diag
+            item=calculate(code,name,sector,df,provider,flows,
+                           provisional,quote_time,bar_status,reason,diag)
+            item['ths_flow_3d_reference']=ths_rank.get(code)
+            item['data_quality_note']='同花顺三日净额仅供交叉参考，不用于逐日资金强度或第一梯队资格'
+            data['stocks'].append(item)
             print('OK', code, flush=True)
         except Exception as exc:
             data['errors'].append({'code':code,'error':str(exc)[:180]})
@@ -374,10 +456,36 @@ def main():
                 s['trade_eligible']=False
     data['latest_universe_date']=freshest
     data['expected_session_date']=expected_date
-    data['stocks'].sort(key=lambda s: (
-        {'第一':0,'第二':1,'第三':2}[s['tier'][0:2]], -s['score'], s['code']))
-    if data['errors']:
-        data['status']='partial'
+    for item in data['stocks']:
+        risks = item.get('stop_distance_pct')
+        dev = item.get('ma20_deviation_pct')
+        item['rotation_priority'] = round(
+            (100 if item.get('trade_eligible') else 0)
+            + (18 if not item.get('is_stale') else -35)
+            + (15 if item.get('bar_status')=='historical_daily' else -12)
+            + (12 if item.get('fund_flow_status')=='available' else -15)
+            + (15 if item.get('risk_ok') else -25)
+            + (12 if dev is not None and 0 < dev <= MAX_MA20_DEVIATION_PCT else -20)
+            + min(20, item.get('score',0)*0.2), 2)
+        item['recommendation_label'] = (
+            '正式符合准入' if item.get('trade_eligible') else
+            '暂停推荐：行情滞后' if item.get('is_stale') else
+            '强势观察：临时行情' if item.get('bar_status')!='historical_daily' else
+            '等待买点：风控未通过' if not item.get('risk_ok') else
+            '观察：资金/趋势条件未齐')
+    data['stocks'].sort(key=lambda s:(-s['rotation_priority'], -s['score'], s['code']))
+    # This rotation covers only the named watchlist. Do not claim whole-market scanning.
+    data['rotation_scope']='人工候选池轮换（15选12），不是全市场实时选股'
+    data['candidate_count']=len(data['stocks'])
+    data['excluded_candidates']=[{'code':s['code'],'name':s['name'],'priority':s['rotation_priority'],
+                                  'reason':s['recommendation_label']}
+                                 for s in data['stocks'][MAX_ACTIVE_STOCKS:]]
+    data['stocks']=data['stocks'][:MAX_ACTIVE_STOCKS]
+    data['current_session_count']=sum(s['asof']==expected_date for s in data['stocks'])
+    data['confirmed_current_count']=sum(s['asof']==expected_date and s['bar_status']=='historical_daily' for s in data['stocks'])
+    data['complete_flow_count']=sum(s['fund_flow_status']=='available' for s in data['stocks'])
+    data['status']='partial' if (data['errors'] or data['current_session_count']<len(data['stocks'])) else 'ok'
+    data['refresh_completeness']='complete' if data['status']=='ok' and data['confirmed_current_count']==len(data['stocks']) else 'incomplete_or_intraday'
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(data,ensure_ascii=False,separators=(',',':')), encoding='utf-8')
     print('Wrote', OUT, 'stocks',len(data['stocks']), 'latest',freshest)
